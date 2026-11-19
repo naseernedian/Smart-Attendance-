@@ -1,0 +1,8 @@
+{
+  "name": "Smart Attendance",
+  "description": "Offline-first biometric student and admin attendance application for GPS Koz Shinoli (EMIS Code 61673).",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

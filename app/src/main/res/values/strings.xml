@@ -1,0 +1,12 @@
+<resources>
+    <string name="app_name">Smart Attendance</string>
+    <string name="school_app_title">SMART ATTENDANCE APP</string>
+    <string name="school_name">GPS Koz Shinoli</string>
+    <string name="school_emis_code">EMIS Code: 61673</string>
+    <string name="developer_credit">Developed by Naseer Ud Din Shinwari</string>
+    <string name="status_present">PRESENT</string>
+    <string name="status_absent">ABSENT</string>
+    <string name="status_leave">LEAVE</string>
+    <string name="status_verified">VERIFIED</string>
+    <string name="camera_permission_required">Camera permission is required for live facial verification and QR scanning.</string>
+</resources>
