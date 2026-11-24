@@ -106,6 +106,16 @@ class SyncRepository(
                 }
             }
 
+            // 1.5 Push any offline student deletions before pulling remote students
+            val pendingDeletes = sessionPreferences.getPendingDeletedStudentUids()
+            pendingDeletes.forEach { deletedUid ->
+                val delResp = api.deleteStudent(bearer, deletedUid)
+                if (delResp.isSuccessful || delResp.code() == 404) {
+                    sessionPreferences.removePendingDeletedStudentUid(deletedUid)
+                }
+            }
+            val remainingPendingDeletes = sessionPreferences.getPendingDeletedStudentUids()
+
             // 2. Upload pending append-only attendance records in batches of 25
             while (true) {
                 val batch = attendanceDao.getPendingAttendanceBatch(25)
@@ -143,28 +153,33 @@ class SyncRepository(
                 }
             }
 
-            // 3. Pull remote students & attendance (idempotent IGNORE so local originals are preserved)
+            // 3. Pull remote students & attendance (preserving local pending edits/deletes)
             val remoteStudentsResp = api.fetchRemoteStudents(bearer)
             if (remoteStudentsResp.isSuccessful) {
                 remoteStudentsResp.body().orEmpty().forEach { dto ->
+                    if (dto.studentUid in remainingPendingDeletes) return@forEach
                     val encryptedEmbedding = cryptoManager.encryptEmbedding(dto.faceEmbedding.toFloatArray())
                     val thumb = Base64.decode(dto.faceThumbnailB64, Base64.NO_WRAP)
-                    val inserted = studentDao.insertStudentIgnore(
-                        StudentEntity(
-                            studentUid = dto.studentUid,
-                            studentName = dto.studentName,
-                            fatherName = dto.fatherName,
-                            className = dto.className,
-                            rollNumber = dto.rollNumber,
-                            qrPayload = dto.qrPayload,
-                            encryptedFaceEmbedding = encryptedEmbedding,
-                            faceThumbnailBytes = thumb,
-                            registeredByAdminUid = dto.registeredByAdminUid,
-                            createdAtEpochMs = dto.createdAtEpochMs,
-                            syncStatus = SyncStatus.SYNCED.name
-                        )
+                    val remoteEntity = StudentEntity(
+                        studentUid = dto.studentUid,
+                        studentName = dto.studentName,
+                        fatherName = dto.fatherName,
+                        className = dto.className,
+                        rollNumber = dto.rollNumber,
+                        qrPayload = dto.qrPayload,
+                        encryptedFaceEmbedding = encryptedEmbedding,
+                        faceThumbnailBytes = thumb,
+                        registeredByAdminUid = dto.registeredByAdminUid,
+                        createdAtEpochMs = dto.createdAtEpochMs,
+                        syncStatus = SyncStatus.SYNCED.name
                     )
-                    if (inserted != -1L) studentsPulled++
+                    val existingLocal = studentDao.findByUid(dto.studentUid)
+                    if (existingLocal == null) {
+                        val inserted = studentDao.insertStudentIgnore(remoteEntity)
+                        if (inserted != -1L) studentsPulled++
+                    } else if (existingLocal.syncStatus == SyncStatus.SYNCED.name) {
+                        studentDao.updateStudent(remoteEntity)
+                    }
                 }
             }
 

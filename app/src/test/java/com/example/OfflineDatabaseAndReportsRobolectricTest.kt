@@ -4,6 +4,7 @@ import android.content.Context
 import android.database.sqlite.SQLiteException
 import androidx.test.core.app.ApplicationProvider
 import com.example.biometrics.QrCodeManager
+import com.example.data.local.AdminEntity
 import com.example.data.local.AttendanceRecordEntity
 import com.example.data.local.SessionPreferences
 import com.example.data.local.SmartAttendanceDatabase
@@ -12,19 +13,24 @@ import com.example.data.remote.AdminFaceVerifyRequest
 import com.example.data.remote.AdminFaceVerifyResponse
 import com.example.data.remote.AdminLoginRequest
 import com.example.data.remote.AdminLoginResponse
+import com.example.data.remote.AdminProfileDto
 import com.example.data.remote.AdminRegistrationRequest
 import com.example.data.remote.AdminRegistrationResponse
+import com.example.data.remote.AdminUpdateRequestDto
 import com.example.data.remote.AttendanceApiService
 import com.example.data.remote.AttendanceBatchSyncRequest
 import com.example.data.remote.AttendanceBatchSyncResponse
 import com.example.data.remote.AttendanceSyncItemDto
+import com.example.data.remote.DeleteActionResponseDto
 import com.example.data.remote.DirectPasswordResetRequestDto
 import com.example.data.remote.StudentBatchSyncRequest
 import com.example.data.remote.StudentBatchSyncResponse
 import com.example.data.remote.StudentSyncItemDto
+import com.example.data.remote.StudentUpdateRequestDto
 import com.example.data.remote.SyncedAttendanceRefDto
 import com.example.data.sync.NetworkConnectivityObserver
 import com.example.data.sync.SyncRepository
+import com.example.domain.AdminAuthorizationStatus
 import com.example.domain.AttendanceStatus
 import com.example.domain.ExportFormat
 import com.example.domain.ReportPeriod
@@ -319,6 +325,8 @@ class OfflineDatabaseAndReportsRobolectricTest {
     }
 
     private class FakeApiService : AttendanceApiService {
+        val deletedStudentUids = mutableListOf<String>()
+
         override suspend fun registerAdmin(request: AdminRegistrationRequest): Response<AdminRegistrationResponse> =
             error("unused")
         override suspend fun loginAdmin(request: AdminLoginRequest): Response<AdminLoginResponse> =
@@ -327,6 +335,51 @@ class OfflineDatabaseAndReportsRobolectricTest {
             error("unused")
         override suspend fun resetPasswordDirect(request: DirectPasswordResetRequestDto): Response<AdminRegistrationResponse> =
             error("unused")
+        override suspend fun updateMyProfile(
+            bearerToken: String,
+            request: AdminUpdateRequestDto
+        ): Response<AdminProfileDto> = Response.success(
+            AdminProfileDto(
+                adminUid = "admin-1",
+                fullName = request.fullName,
+                designation = request.designation,
+                mobileNormalized = request.mobileNormalized,
+                cnicNormalized = request.cnicNormalized,
+                cnicFormatted = request.cnicNormalized,
+                email = request.email,
+                authorizationStatus = AdminAuthorizationStatus.APPROVED.name,
+                authorizedBy = "OPEN_ACCESS",
+                faceEmbedding = emptyList(),
+                faceThumbnailB64 = ""
+            )
+        )
+        override suspend fun deleteMyAccount(bearerToken: String): Response<DeleteActionResponseDto> =
+            Response.success(DeleteActionResponseDto(deleted = true, message = "Deleted"))
+        override suspend fun updateStudent(
+            bearerToken: String,
+            studentUid: String,
+            request: StudentUpdateRequestDto
+        ): Response<StudentSyncItemDto> = Response.success(
+            StudentSyncItemDto(
+                studentUid = studentUid,
+                studentName = request.studentName,
+                fatherName = request.fatherName,
+                className = request.className,
+                rollNumber = request.rollNumber,
+                qrPayload = request.qrPayload,
+                faceEmbedding = request.faceEmbedding ?: emptyList(),
+                faceThumbnailB64 = request.faceThumbnailB64 ?: "",
+                registeredByAdminUid = "admin-1",
+                createdAtEpochMs = 1700000000000L
+            )
+        )
+        override suspend fun deleteStudent(
+            bearerToken: String,
+            studentUid: String
+        ): Response<DeleteActionResponseDto> {
+            deletedStudentUids += studentUid
+            return Response.success(DeleteActionResponseDto(deleted = true, message = "Deleted"))
+        }
 
         override suspend fun syncStudents(
             bearerToken: String,
@@ -442,5 +495,161 @@ class OfflineDatabaseAndReportsRobolectricTest {
         val presentRecord = appAttendanceDao.findByStudentAndDate(presentUid, today)
         assertEquals(AttendanceStatus.PRESENT.name, presentRecord?.status)
         assertEquals(originalIso, presentRecord?.markedAtIso)
+    }
+
+    @Test
+    fun `user account edit and delete update room and clear biometric preference`() = runTest {
+        val adminDao = db.adminDao()
+        val prefs = SessionPreferences(context, crypto)
+
+        val admin = AdminEntity(
+            adminUid = "admin-edit-1",
+            fullName = "Tariq Khan",
+            designation = "PST Teacher",
+            mobileNormalized = "03001112233",
+            cnicNormalized = "1234512345671",
+            cnicFormatted = "1234512345671",
+            email = "tariq@school.edu.pk",
+            passwordSaltB64 = "salt",
+            passwordHashB64 = "hash",
+            encryptedFaceEmbedding = ByteArray(0),
+            faceThumbnailBytes = ByteArray(0),
+            cnicFrontDocPath = "",
+            cnicBackDocPath = "",
+            employmentDocPath = "",
+            authorizationStatus = AdminAuthorizationStatus.APPROVED.name,
+            authorizedBy = "OPEN_ACCESS",
+            createdAtEpochMs = 1700000000000L,
+            syncStatus = SyncStatus.PENDING.name
+        )
+        adminDao.upsertAdmin(admin)
+        prefs.enableBiometricForAdmin(admin.adminUid)
+        assertTrue(prefs.biometricEnabledFlow.first())
+        assertEquals(admin.adminUid, prefs.biometricAdminUidFlow.first())
+
+        // Self-conflict exclusion allows editing own profile cleanly
+        assertNull(adminDao.findOtherByCnicOrMobile("1234512345671", admin.adminUid))
+        assertNull(adminDao.findOtherByEmail("tariq@school.edu.pk", admin.adminUid))
+
+        val updated = admin.copy(
+            fullName = "Tariq Mahmood",
+            mobileNormalized = "03119998877",
+            email = "tariq.m@school.edu.pk"
+        )
+        adminDao.upsertAdmin(updated)
+        assertEquals("Tariq Mahmood", adminDao.findByUid(admin.adminUid)?.fullName)
+        assertEquals("03119998877", adminDao.findByUid(admin.adminUid)?.mobileNormalized)
+
+        // Deleting account deletes row and clears biometric lock preference
+        adminDao.deleteByUid(admin.adminUid)
+        prefs.clearBiometricIfMatches(admin.adminUid)
+        assertNull(adminDao.findByUid(admin.adminUid))
+        assertFalse(prefs.biometricEnabledFlow.first())
+        assertNull(prefs.biometricAdminUidFlow.first())
+    }
+
+    @Test
+    fun `student profile edit and delete preserve attendance history and sync offline deletions`() = runTest {
+        val app = ApplicationProvider.getApplicationContext<SmartAttendanceApp>()
+        val appDb = app.container.database
+        val appStudentDao = appDb.studentDao()
+        val appAttendanceDao = appDb.attendanceRecordDao()
+        val appCrypto = app.container.cryptoManager
+        val appPrefs = app.container.sessionPreferences
+
+        val uid = "stu-edit-del-${System.nanoTime()}"
+        val today = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+        appStudentDao.insertStudentIgnore(
+            StudentEntity(
+                studentUid = uid,
+                studentName = "Asad Ali",
+                fatherName = "Farman Ali",
+                className = "Class 2",
+                rollNumber = "201-${System.nanoTime()}",
+                qrPayload = QrCodeManager.buildStudentQrPayload(uid, "Class 2", "201"),
+                encryptedFaceEmbedding = appCrypto.encryptEmbedding(FloatArray(256) { 0.6f }),
+                faceThumbnailBytes = byteArrayOf(1, 2, 3),
+                registeredByAdminUid = "admin-1",
+                createdAtEpochMs = 1700000000000L,
+                syncStatus = SyncStatus.SYNCED.name
+            )
+        )
+        appAttendanceDao.insertAttendanceAppendOnly(
+            AttendanceRecordEntity(
+                localUid = "att-keep-${System.nanoTime()}",
+                studentUid = uid,
+                studentNameSnapshot = "Asad Ali",
+                fatherNameSnapshot = "Farman Ali",
+                classNameSnapshot = "Class 2",
+                rollNumberSnapshot = "201",
+                status = AttendanceStatus.PRESENT.name,
+                attendanceDate = today,
+                markedAtIso = "${today}T08:15:00",
+                markedAtEpochMs = 1700000900000L,
+                verifiedSimilarity = 0.95f,
+                markedByAdminUid = "admin-1",
+                syncStatus = SyncStatus.SYNCED.name
+            )
+        )
+
+        val viewModel = MainWorkspaceViewModel(app)
+        var editSucceeded = false
+        viewModel.editStudentProfile(
+            studentUid = uid,
+            studentName = "Asad Khan",
+            fatherName = "Farman Khan",
+            className = "Class 3",
+            rollNumber = "301"
+        ) { ok ->
+            editSucceeded = ok
+        }
+        var waitTicks = 0
+        while (!editSucceeded && waitTicks < 40) {
+            ShadowLooper.idleMainLooper()
+            Thread.sleep(40)
+            waitTicks++
+        }
+        assertTrue(editSucceeded)
+
+        val editedStudent = appStudentDao.findByUid(uid)
+        assertEquals("Asad Khan", editedStudent?.studentName)
+        assertEquals("Class 3", editedStudent?.className)
+        assertEquals("301", editedStudent?.rollNumber)
+
+        // Delete offline (no JWT / no connection) -> queues pending deleted UID while preserving attendance
+        var deleteDone = false
+        viewModel.deleteStudentProfile(uid) {
+            deleteDone = true
+        }
+        waitTicks = 0
+        while (!deleteDone && waitTicks < 40) {
+            ShadowLooper.idleMainLooper()
+            Thread.sleep(40)
+            waitTicks++
+        }
+        assertTrue(deleteDone)
+        assertNull(appStudentDao.findByUid(uid))
+        assertTrue(appAttendanceDao.findByStudentAndDate(uid, today) != null)
+        assertTrue(appPrefs.getPendingDeletedStudentUids().contains(uid))
+
+        // When connectivity returns with JWT, SyncRepository pushes pending deletion to backend
+        appPrefs.saveEncryptedJwt("valid-jwt", "admin-1")
+        val onlineConnectivity = object : NetworkConnectivityObserver(app) {
+            override fun checkCurrentConnectivity(): Boolean = true
+        }
+        val repo = SyncRepository(
+            context = app,
+            adminDao = appDb.adminDao(),
+            studentDao = appStudentDao,
+            attendanceDao = appAttendanceDao,
+            sessionPreferences = appPrefs,
+            cryptoManager = appCrypto,
+            connectivityObserver = onlineConnectivity
+        )
+        val fakeApi = FakeApiService()
+        val syncOutcome = repo.syncAll { fakeApi }
+        assertTrue(syncOutcome.success)
+        assertTrue(fakeApi.deletedStudentUids.contains(uid))
+        assertFalse(appPrefs.getPendingDeletedStudentUids().contains(uid))
     }
 }

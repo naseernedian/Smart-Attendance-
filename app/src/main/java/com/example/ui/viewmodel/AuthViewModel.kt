@@ -11,6 +11,7 @@ import com.example.data.local.AdminEntity
 import com.example.data.remote.AdminFaceVerifyRequest
 import com.example.data.remote.AdminLoginRequest
 import com.example.data.remote.AdminRegistrationRequest
+import com.example.data.remote.AdminUpdateRequestDto
 import com.example.data.remote.AttendanceApiService
 import com.example.data.remote.DirectPasswordResetRequestDto
 import com.example.domain.AdminAuthorizationStatus
@@ -45,6 +46,7 @@ data class AdminAuthUiState(
     val infoMessage: String? = null,
     val pendingChallengeAdmin: AdminEntity? = null,
     val pendingServerChallengeToken: String? = null,
+    val pendingEnableBiometric: Boolean = false,
     val authenticatedAdmin: AdminEntity? = null,
     val registeredProfile: AdminEntity? = null
 )
@@ -65,6 +67,16 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope,
         SharingStarted.WhileSubscribed(5000),
         "http://10.0.2.2:8000/"
+    )
+    val biometricEnabled: StateFlow<Boolean> = prefs.biometricEnabledFlow.stateIn(
+        viewModelScope,
+        SharingStarted.WhileSubscribed(5000),
+        false
+    )
+    val biometricAdminUid: StateFlow<String?> = prefs.biometricAdminUidFlow.stateIn(
+        viewModelScope,
+        SharingStarted.WhileSubscribed(5000),
+        null
     )
     val localAdmins: StateFlow<List<AdminEntity>> = adminDao.observeAllAdmins().stateIn(
         viewModelScope,
@@ -104,6 +116,10 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(errorMessage = null, infoMessage = null) }
     }
 
+    fun setAuthError(message: String) {
+        _uiState.update { it.copy(errorMessage = message, infoMessage = null) }
+    }
+
     fun updateBackendUrl(newUrl: String) {
         viewModelScope.launch {
             prefs.setBackendBaseUrl(newUrl)
@@ -111,7 +127,11 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun submitCredentials(usernameInput: String, password: String) {
+    fun submitCredentials(
+        usernameInput: String,
+        password: String,
+        enableBiometricOnSuccess: Boolean = false
+    ) {
         val parsed = Validators.parseAdminUsername(usernameInput)
         val lookupKey = when (parsed) {
             is UsernameValidationResult.ValidCnic -> parsed.cnic
@@ -127,7 +147,14 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         viewModelScope.launch {
-            _uiState.update { it.copy(isBusy = true, errorMessage = null, infoMessage = null) }
+            _uiState.update {
+                it.copy(
+                    isBusy = true,
+                    errorMessage = null,
+                    infoMessage = null,
+                    pendingEnableBiometric = enableBiometricOnSuccess
+                )
+            }
             if (connectivity.checkCurrentConnectivity()) {
                 try {
                     val api = AttendanceApiService.create(prefs.getBackendBaseUrl())
@@ -179,6 +206,9 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
                             body.accessToken?.let { jwt ->
                                 prefs.saveEncryptedJwt(jwt, adminEntity.adminUid)
                             }
+                            if (enableBiometricOnSuccess) {
+                                prefs.enableBiometricForAdmin(adminEntity.adminUid)
+                            }
                             _uiState.update {
                                 it.copy(
                                     isBusy = false,
@@ -186,6 +216,7 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
                                     authenticatedAdmin = adminEntity,
                                     pendingChallengeAdmin = null,
                                     pendingServerChallengeToken = null,
+                                    pendingEnableBiometric = false,
                                     errorMessage = null,
                                     infoMessage = null
                                 )
@@ -203,6 +234,7 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
                                     stage = AuthStage.LIVE_FACE_VERIFICATION,
                                     pendingChallengeAdmin = adminEntity,
                                     pendingServerChallengeToken = body.challengeToken,
+                                    pendingEnableBiometric = enableBiometricOnSuccess,
                                     infoMessage = "Credentials verified. Complete live facial verification to unlock."
                                 )
                             }
@@ -243,6 +275,9 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
                 return@launch
             }
             if (localAdmin.encryptedFaceEmbedding.isEmpty()) {
+                if (enableBiometricOnSuccess) {
+                    prefs.enableBiometricForAdmin(localAdmin.adminUid)
+                }
                 _uiState.update {
                     it.copy(
                         isBusy = false,
@@ -250,6 +285,7 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
                         authenticatedAdmin = localAdmin,
                         pendingChallengeAdmin = null,
                         pendingServerChallengeToken = null,
+                        pendingEnableBiometric = false,
                         errorMessage = null,
                         infoMessage = null
                     )
@@ -261,6 +297,7 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
                         stage = AuthStage.LIVE_FACE_VERIFICATION,
                         pendingChallengeAdmin = localAdmin,
                         pendingServerChallengeToken = null,
+                        pendingEnableBiometric = enableBiometricOnSuccess,
                         infoMessage = "Offline credentials verified. Complete live facial verification."
                     )
                 }
@@ -330,6 +367,9 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
 
+            if (_uiState.value.pendingEnableBiometric) {
+                prefs.enableBiometricForAdmin(targetAdmin.adminUid)
+            }
             _uiState.update {
                 it.copy(
                     isBusy = false,
@@ -337,10 +377,198 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
                     authenticatedAdmin = targetAdmin,
                     pendingChallengeAdmin = null,
                     pendingServerChallengeToken = null,
+                    pendingEnableBiometric = false,
                     errorMessage = null,
                     infoMessage = null
                 )
             }
+        }
+    }
+
+    fun completeBiometricLogin(adminUid: String) {
+        viewModelScope.launch {
+            _uiState.update { it.copy(isBusy = true, errorMessage = null, infoMessage = null) }
+            val localAdmin = adminDao.findByUid(adminUid)
+            if (localAdmin == null) {
+                prefs.clearBiometricIfMatches(adminUid)
+                _uiState.update {
+                    it.copy(
+                        isBusy = false,
+                        errorMessage = "Biometric account was removed from this device. Sign in with Mobile/CNIC and password."
+                    )
+                }
+                return@launch
+            }
+            _uiState.update {
+                it.copy(
+                    isBusy = false,
+                    stage = AuthStage.AUTHENTICATED,
+                    authenticatedAdmin = localAdmin,
+                    pendingChallengeAdmin = null,
+                    pendingServerChallengeToken = null,
+                    pendingEnableBiometric = false,
+                    errorMessage = null,
+                    infoMessage = null
+                )
+            }
+        }
+    }
+
+    fun setBiometricEnabledForAuthenticatedUser(enabled: Boolean) {
+        val currentAdmin = _uiState.value.authenticatedAdmin ?: return
+        viewModelScope.launch {
+            if (enabled) {
+                prefs.enableBiometricForAdmin(currentAdmin.adminUid)
+                _uiState.update { it.copy(infoMessage = "Biometric login enabled for ${currentAdmin.fullName}.") }
+            } else {
+                prefs.clearBiometricIfMatches(currentAdmin.adminUid)
+                _uiState.update { it.copy(infoMessage = "Biometric login disabled.") }
+            }
+        }
+    }
+
+    fun disableBiometricLogin() {
+        viewModelScope.launch {
+            prefs.disableBiometric()
+            _uiState.update {
+                it.copy(
+                    errorMessage = null,
+                    infoMessage = "Biometric login disabled on this device."
+                )
+            }
+        }
+    }
+
+    fun updateAuthenticatedAccount(
+        fullName: String,
+        designation: String,
+        mobileInput: String,
+        cnicInput: String,
+        emailInput: String
+    ) {
+        val currentAdmin = _uiState.value.authenticatedAdmin ?: return
+        val cleanName = fullName.trim()
+        val cleanDesignation = designation.trim()
+        if (cleanName.length < 3) {
+            _uiState.update { it.copy(errorMessage = "Full name must be at least 3 characters.") }
+            return
+        }
+        if (cleanDesignation.length < 2) {
+            _uiState.update { it.copy(errorMessage = "Enter official designation.") }
+            return
+        }
+        val mobile = Validators.validateMobile(mobileInput)
+        if (mobile == null) {
+            _uiState.update { it.copy(errorMessage = "Enter valid mobile number (03XXXXXXXXX).") }
+            return
+        }
+        val cnic = Validators.validateCnic(cnicInput)
+        if (cnic == null) {
+            _uiState.update { it.copy(errorMessage = "CNIC must be 13 digits (XXXXXXXXXXXXX).") }
+            return
+        }
+        if (!Validators.isValidEmail(emailInput)) {
+            _uiState.update { it.copy(errorMessage = "Enter valid email address.") }
+            return
+        }
+        val cleanEmail = emailInput.trim().lowercase()
+
+        viewModelScope.launch {
+            _uiState.update { it.copy(isBusy = true, errorMessage = null, infoMessage = null) }
+
+            val conflict = adminDao.findOtherByCnicOrMobile(cnic, currentAdmin.adminUid)
+                ?: adminDao.findOtherByCnicOrMobile(mobile, currentAdmin.adminUid)
+                ?: adminDao.findOtherByEmail(cleanEmail, currentAdmin.adminUid)
+            if (conflict != null) {
+                _uiState.update {
+                    it.copy(
+                        isBusy = false,
+                        errorMessage = "Mobile, CNIC, or email already belongs to another user account."
+                    )
+                }
+                return@launch
+            }
+
+            var syncStatus = SyncStatus.PENDING.name
+            val jwt = prefs.getDecryptedJwt()
+            if (!jwt.isNullOrBlank() && connectivity.checkCurrentConnectivity()) {
+                try {
+                    val api = AttendanceApiService.create(prefs.getBackendBaseUrl())
+                    val resp = api.updateMyProfile(
+                        bearerToken = "Bearer $jwt",
+                        request = AdminUpdateRequestDto(
+                            fullName = cleanName,
+                            designation = cleanDesignation,
+                            mobileNormalized = mobile,
+                            cnicNormalized = cnic,
+                            email = cleanEmail
+                        )
+                    )
+                    if (resp.isSuccessful) {
+                        syncStatus = SyncStatus.SYNCED.name
+                    } else if (resp.code() in 400..409) {
+                        val detail = extractServerDetail(resp.errorBody()?.string().orEmpty())
+                            ?: "Server rejected account update (${resp.code()})."
+                        _uiState.update { it.copy(isBusy = false, errorMessage = detail) }
+                        return@launch
+                    }
+                } catch (_: Throwable) {
+                    // Offline or server unreachable: save local update immediately
+                }
+            }
+
+            val updatedAdmin = currentAdmin.copy(
+                fullName = cleanName,
+                designation = cleanDesignation,
+                mobileNormalized = mobile,
+                cnicNormalized = cnic,
+                cnicFormatted = cnic,
+                email = cleanEmail,
+                syncStatus = syncStatus
+            )
+            adminDao.upsertAdmin(updatedAdmin)
+            _uiState.update {
+                it.copy(
+                    isBusy = false,
+                    authenticatedAdmin = updatedAdmin,
+                    errorMessage = null,
+                    infoMessage = "User account updated."
+                )
+            }
+        }
+    }
+
+    fun deleteAuthenticatedAccount() {
+        val currentAdmin = _uiState.value.authenticatedAdmin ?: return
+        viewModelScope.launch {
+            _uiState.update { it.copy(isBusy = true, errorMessage = null, infoMessage = null) }
+
+            val jwt = prefs.getDecryptedJwt()
+            if (!jwt.isNullOrBlank() && connectivity.checkCurrentConnectivity()) {
+                try {
+                    val api = AttendanceApiService.create(prefs.getBackendBaseUrl())
+                    api.deleteMyAccount("Bearer $jwt")
+                } catch (_: Throwable) {
+                    // Continue with local deletion in offline mode
+                }
+            }
+
+            withContext(Dispatchers.IO) {
+                listOf(
+                    currentAdmin.cnicFrontDocPath,
+                    currentAdmin.cnicBackDocPath,
+                    currentAdmin.employmentDocPath
+                ).filter { it.isNotBlank() }.forEach { path ->
+                    runCatching { java.io.File(path).delete() }
+                }
+            }
+            adminDao.deleteByUid(currentAdmin.adminUid)
+            prefs.clearBiometricIfMatches(currentAdmin.adminUid)
+            prefs.clearJwt()
+            _uiState.value = AdminAuthUiState(
+                stage = AuthStage.LOGIN,
+                infoMessage = "User account deleted. Attendance records remain preserved."
+            )
         }
     }
 

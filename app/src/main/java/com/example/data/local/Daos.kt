@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Update
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -36,6 +37,15 @@ interface AdminDao {
 
     @Query("UPDATE admins SET password_salt_b64 = :saltB64, password_hash_b64 = :hashB64 WHERE admin_uid = :adminUid")
     suspend fun updatePasswordVerifier(adminUid: String, saltB64: String, hashB64: String)
+
+    @Query("SELECT * FROM admins WHERE (cnic_normalized = :key OR mobile_normalized = :key) AND admin_uid != :excludeAdminUid LIMIT 1")
+    suspend fun findOtherByCnicOrMobile(key: String, excludeAdminUid: String): AdminEntity?
+
+    @Query("SELECT * FROM admins WHERE email = :email AND admin_uid != :excludeAdminUid LIMIT 1")
+    suspend fun findOtherByEmail(email: String, excludeAdminUid: String): AdminEntity?
+
+    @Query("DELETE FROM admins WHERE admin_uid = :adminUid")
+    suspend fun deleteByUid(adminUid: String)
 }
 
 @Dao
@@ -63,6 +73,12 @@ interface StudentDao {
 
     @Query("UPDATE students SET sync_status = 'SYNCED' WHERE student_uid = :studentUid")
     suspend fun markStudentSynced(studentUid: String)
+
+    @Update
+    suspend fun updateStudent(student: StudentEntity)
+
+    @Query("DELETE FROM students WHERE student_uid = :studentUid")
+    suspend fun deleteStudentByUid(studentUid: String)
 
     @Query("SELECT COUNT(*) FROM students WHERE sync_status = 'PENDING'")
     fun observePendingStudentCount(): Flow<Int>

@@ -79,6 +79,32 @@ data class DirectPasswordResetRequestDto(
 )
 
 @JsonClass(generateAdapter = true)
+data class AdminUpdateRequestDto(
+    @Json(name = "full_name") val fullName: String,
+    @Json(name = "designation") val designation: String,
+    @Json(name = "mobile_normalized") val mobileNormalized: String,
+    @Json(name = "cnic_normalized") val cnicNormalized: String,
+    @Json(name = "email") val email: String
+)
+
+@JsonClass(generateAdapter = true)
+data class StudentUpdateRequestDto(
+    @Json(name = "student_name") val studentName: String,
+    @Json(name = "father_name") val fatherName: String,
+    @Json(name = "class_name") val className: String,
+    @Json(name = "roll_number") val rollNumber: String,
+    @Json(name = "qr_payload") val qrPayload: String,
+    @Json(name = "face_embedding") val faceEmbedding: List<Float>? = null,
+    @Json(name = "face_thumbnail_b64") val faceThumbnailB64: String? = null
+)
+
+@JsonClass(generateAdapter = true)
+data class DeleteActionResponseDto(
+    @Json(name = "deleted") val deleted: Boolean,
+    @Json(name = "message") val message: String
+)
+
+@JsonClass(generateAdapter = true)
 data class StudentSyncItemDto(
     @Json(name = "student_uid") val studentUid: String,
     @Json(name = "student_name") val studentName: String,

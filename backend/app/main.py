@@ -1,11 +1,12 @@
 import base64
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict, List, Optional
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -124,6 +125,29 @@ class PasswordResetConfirmDto(BaseModel):
 class DirectPasswordResetRequestDto(BaseModel):
     username: str
     new_password: str = Field(min_length=8)
+
+
+class AdminUpdateRequest(BaseModel):
+    full_name: str = Field(min_length=3, max_length=150)
+    designation: str = Field(min_length=2, max_length=120)
+    mobile_normalized: str
+    cnic_normalized: str
+    email: str
+
+
+class StudentUpdateRequest(BaseModel):
+    student_name: str = Field(min_length=2, max_length=150)
+    father_name: str = Field(min_length=2, max_length=150)
+    class_name: str = Field(min_length=1, max_length=40)
+    roll_number: str = Field(min_length=1, max_length=30)
+    qr_payload: str
+    face_embedding: Optional[List[float]] = None
+    face_thumbnail_b64: Optional[str] = None
+
+
+class DeleteActionResponse(BaseModel):
+    deleted: bool
+    message: str
 
 
 class StudentSyncItemDto(BaseModel):
@@ -423,6 +447,153 @@ def reset_password_direct(req: DirectPasswordResetRequestDto, db: Session = Depe
     )
 
 
+@app.put("/api/v1/auth/me", response_model=AdminProfileDto)
+def update_current_admin(
+    req: AdminUpdateRequest,
+    current_admin: Admin = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    cnic_pair = validate_cnic(req.cnic_normalized)
+    if not cnic_pair:
+        raise HTTPException(status_code=400, detail="Invalid Pakistani CNIC (13 digits: XXXXXXXXXXXXX).")
+    mobile_pair = validate_mobile(req.mobile_normalized)
+    if not mobile_pair:
+        raise HTTPException(status_code=400, detail="Invalid mobile number (03XXXXXXXXX).")
+
+    clean_email = req.email.strip().lower()
+    if "@" not in clean_email or "." not in clean_email.split("@")[-1]:
+        raise HTTPException(status_code=400, detail="Enter valid email address.")
+
+    current_admin.full_name = req.full_name.strip()
+    current_admin.designation = req.designation.strip()
+    current_admin.mobile_normalized = mobile_pair[0]
+    current_admin.cnic_normalized = cnic_pair[0]
+    current_admin.cnic_formatted = cnic_pair[0]
+    current_admin.email = clean_email
+    try:
+        db.commit()
+        db.refresh(current_admin)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Mobile, CNIC, or email already belongs to another account.")
+
+    emb = decrypt_embedding(current_admin.face_embedding_enc) if current_admin.face_embedding_enc else []
+    return AdminProfileDto(
+        admin_uid=current_admin.admin_uid,
+        full_name=current_admin.full_name,
+        designation=current_admin.designation,
+        mobile_normalized=current_admin.mobile_normalized,
+        cnic_normalized=current_admin.cnic_normalized,
+        cnic_formatted=current_admin.cnic_formatted,
+        email=current_admin.email,
+        authorization_status=current_admin.authorization_status,
+        authorized_by=current_admin.authorized_by,
+        face_embedding=emb,
+        face_thumbnail_b64=current_admin.face_thumbnail_b64 or "",
+    )
+
+
+@app.delete("/api/v1/auth/me", response_model=DeleteActionResponse)
+def delete_current_admin(
+    current_admin: Admin = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    for p_str in (
+        current_admin.cnic_front_doc_path,
+        current_admin.cnic_back_doc_path,
+        current_admin.employment_doc_path,
+    ):
+        if p_str:
+            try:
+                Path(p_str).unlink(missing_ok=True)
+            except OSError:
+                pass
+    db.execute(delete(PasswordResetToken).where(PasswordResetToken.admin_uid == current_admin.admin_uid))
+    db.delete(current_admin)
+    db.commit()
+    return DeleteActionResponse(
+        deleted=True,
+        message="User account deleted. Attendance records remain preserved.",
+    )
+
+
+@app.put("/api/v1/students/{student_uid}", response_model=StudentSyncItemDto)
+def update_student(
+    student_uid: str,
+    req: StudentUpdateRequest,
+    _: Admin = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    student = db.scalar(select(Student).where(Student.student_uid == student_uid))
+    if not student:
+        raise HTTPException(status_code=404, detail="Student profile not found.")
+
+    clean_class = req.class_name.strip()
+    clean_roll = req.roll_number.strip()
+    collision = db.scalar(
+        select(Student).where(
+            Student.class_name == clean_class,
+            Student.roll_number == clean_roll,
+            Student.student_uid != student_uid,
+        )
+    )
+    if collision:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Duplicate Class/Roll ({clean_class} #{clean_roll}).",
+        )
+
+    student.student_name = req.student_name.strip()
+    student.father_name = req.father_name.strip()
+    student.class_name = clean_class
+    student.roll_number = clean_roll
+    student.qr_payload = req.qr_payload
+    if req.face_embedding is not None and len(req.face_embedding) > 0:
+        student.face_embedding_enc = encrypt_embedding(req.face_embedding)
+    if req.face_thumbnail_b64 is not None and len(req.face_thumbnail_b64) > 0:
+        student.face_thumbnail_b64 = req.face_thumbnail_b64
+
+    try:
+        db.commit()
+        db.refresh(student)
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc.orig))
+
+    return StudentSyncItemDto(
+        student_uid=student.student_uid,
+        student_name=student.student_name,
+        father_name=student.father_name,
+        class_name=student.class_name,
+        roll_number=student.roll_number,
+        qr_payload=student.qr_payload,
+        face_embedding=decrypt_embedding(student.face_embedding_enc),
+        face_thumbnail_b64=student.face_thumbnail_b64,
+        registered_by_admin_uid=student.registered_by_admin_uid,
+        created_at_epoch_ms=student.created_at_epoch_ms,
+    )
+
+
+@app.delete("/api/v1/students/{student_uid}", response_model=DeleteActionResponse)
+def delete_student(
+    student_uid: str,
+    _: Admin = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    student = db.scalar(select(Student).where(Student.student_uid == student_uid))
+    if not student:
+        return DeleteActionResponse(
+            deleted=True,
+            message="Student profile already removed. Attendance records remain preserved.",
+        )
+    db.delete(student)
+    db.commit()
+    return DeleteActionResponse(
+        deleted=True,
+        message="Student profile deleted. Attendance records remain preserved.",
+    )
+
+
 @app.post("/api/v1/sync/students", response_model=StudentBatchSyncResponse)
 def sync_students(
     req: StudentBatchSyncRequest,
@@ -435,17 +606,42 @@ def sync_students(
 
     for item in req.students:
         existing_uid = db.scalar(select(Student).where(Student.student_uid == item.student_uid))
-        if existing_uid:
-            duplicate_uids.append(item.student_uid)
-            continue
         existing_roll = db.scalar(
             select(Student).where(
-                Student.class_name == item.class_name,
-                Student.roll_number == item.roll_number,
+                Student.class_name == item.class_name.strip(),
+                Student.roll_number == item.roll_number.strip(),
+                Student.student_uid != item.student_uid,
             )
         )
         if existing_roll:
             rejected[item.student_uid] = f"Duplicate Class/Roll ({item.class_name} #{item.roll_number})"
+            continue
+
+        if existing_uid:
+            changed = (
+                existing_uid.student_name != item.student_name.strip()
+                or existing_uid.father_name != item.father_name.strip()
+                or existing_uid.class_name != item.class_name.strip()
+                or existing_uid.roll_number != item.roll_number.strip()
+                or existing_uid.qr_payload != item.qr_payload
+                or existing_uid.face_thumbnail_b64 != item.face_thumbnail_b64
+            )
+            if not changed:
+                duplicate_uids.append(item.student_uid)
+                continue
+            existing_uid.student_name = item.student_name.strip()
+            existing_uid.father_name = item.father_name.strip()
+            existing_uid.class_name = item.class_name.strip()
+            existing_uid.roll_number = item.roll_number.strip()
+            existing_uid.qr_payload = item.qr_payload
+            existing_uid.face_embedding_enc = encrypt_embedding(item.face_embedding)
+            existing_uid.face_thumbnail_b64 = item.face_thumbnail_b64
+            try:
+                db.commit()
+                synced_uids.append(item.student_uid)
+            except IntegrityError as exc:
+                db.rollback()
+                rejected[item.student_uid] = str(exc.orig)
             continue
 
         student = Student(

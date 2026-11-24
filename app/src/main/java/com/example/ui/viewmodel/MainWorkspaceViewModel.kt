@@ -2,12 +2,15 @@ package com.example.ui.viewmodel
 
 import android.app.Application
 import android.graphics.Bitmap
+import android.util.Base64
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.SmartAttendanceApp
 import com.example.biometrics.QrCodeManager
 import com.example.data.local.AttendanceRecordEntity
 import com.example.data.local.StudentEntity
+import com.example.data.remote.AttendanceApiService
+import com.example.data.remote.StudentUpdateRequestDto
 import com.example.data.sync.SyncWorker
 import com.example.domain.AttendanceStatus
 import com.example.domain.ExportFormat
@@ -16,6 +19,7 @@ import com.example.domain.FaceMatchResult
 import com.example.domain.ReportPeriod
 import com.example.domain.SyncStatus
 import com.example.reports.GeneratedReportFile
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -23,6 +27,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -105,8 +110,19 @@ class MainWorkspaceViewModel(application: Application) : AndroidViewModel(applic
     private val _isSyncing = MutableStateFlow(false)
     val isSyncing: StateFlow<Boolean> = _isSyncing.asStateFlow()
 
+    private val _profileActionMessage = MutableStateFlow<String?>(null)
+    val profileActionMessage: StateFlow<String?> = _profileActionMessage.asStateFlow()
+
+    private val _profileActionError = MutableStateFlow<String?>(null)
+    val profileActionError: StateFlow<String?> = _profileActionError.asStateFlow()
+
     init {
         refreshReportPreview()
+    }
+
+    fun clearProfileActionMessages() {
+        _profileActionMessage.value = null
+        _profileActionError.value = null
     }
 
     // --- STUDENT REGISTRATION ---
@@ -242,6 +258,181 @@ class MainWorkspaceViewModel(application: Application) : AndroidViewModel(applic
 
     fun resetStudentRegistrationForm() {
         _studentRegState.value = StudentRegUiState()
+    }
+
+    fun editStudentProfile(
+        studentUid: String,
+        studentName: String,
+        fatherName: String,
+        className: String,
+        rollNumber: String,
+        updatedFaceBitmap: Bitmap? = null,
+        onComplete: (Boolean) -> Unit = {}
+    ) {
+        val cleanName = studentName.trim()
+        val cleanFather = fatherName.trim()
+        val cleanClass = className.trim()
+        val cleanRoll = rollNumber.trim()
+        if (cleanName.length < 2) {
+            _profileActionError.value = "Enter Student Name (at least 2 characters)."
+            onComplete(false)
+            return
+        }
+        if (cleanFather.length < 2) {
+            _profileActionError.value = "Enter Father Name (at least 2 characters)."
+            onComplete(false)
+            return
+        }
+        if (cleanClass.isBlank()) {
+            _profileActionError.value = "Select Class."
+            onComplete(false)
+            return
+        }
+        if (cleanRoll.isBlank()) {
+            _profileActionError.value = "Enter Roll Number."
+            onComplete(false)
+            return
+        }
+
+        viewModelScope.launch {
+            _profileActionError.value = null
+            _profileActionMessage.value = null
+
+            val existing = studentDao.findByUid(studentUid)
+            if (existing == null) {
+                _profileActionError.value = "Student profile no longer exists."
+                onComplete(false)
+                return@launch
+            }
+
+            val duplicate = studentDao.findByClassAndRoll(cleanClass, cleanRoll)
+            if (duplicate != null && duplicate.studentUid != studentUid) {
+                _profileActionError.value =
+                    "Duplicate blocked: ${duplicate.studentName} is already registered in $cleanClass with Roll #$cleanRoll."
+                onComplete(false)
+                return@launch
+            }
+
+            var encEmbedding = existing.encryptedFaceEmbedding
+            var thumbBytes = existing.faceThumbnailBytes
+            var newEmbeddingFloats: List<Float>? = null
+            var newThumbB64: String? = null
+
+            if (updatedFaceBitmap != null) {
+                val extractResult = faceEngine.extractEmbeddingFromLiveCapture(updatedFaceBitmap)
+                if (extractResult.isFailure) {
+                    _profileActionError.value =
+                        extractResult.exceptionOrNull()?.message ?: "Failed to process new live face capture."
+                    onComplete(false)
+                    return@launch
+                }
+                val output = extractResult.getOrThrow()
+                encEmbedding = crypto.encryptEmbedding(output.embedding)
+                thumbBytes = output.thumbnailBytes
+                newEmbeddingFloats = output.embedding.toList()
+                newThumbB64 = Base64.encodeToString(output.thumbnailBytes, Base64.NO_WRAP)
+            }
+
+            val updatedQr = QrCodeManager.buildStudentQrPayload(studentUid, cleanClass, cleanRoll)
+            var finalSyncStatus = SyncStatus.PENDING.name
+
+            val jwt = prefs.getDecryptedJwt()
+            if (!jwt.isNullOrBlank() && container.connectivityObserver.checkCurrentConnectivity()) {
+                try {
+                    val api = AttendanceApiService.create(prefs.getBackendBaseUrl())
+                    val resp = withContext(Dispatchers.IO) {
+                        api.updateStudent(
+                            bearerToken = "Bearer $jwt",
+                            studentUid = studentUid,
+                            request = StudentUpdateRequestDto(
+                                studentName = cleanName,
+                                fatherName = cleanFather,
+                                className = cleanClass,
+                                rollNumber = cleanRoll,
+                                qrPayload = updatedQr,
+                                faceEmbedding = newEmbeddingFloats,
+                                faceThumbnailB64 = newThumbB64
+                            )
+                        )
+                    }
+                    if (resp.isSuccessful) {
+                        finalSyncStatus = SyncStatus.SYNCED.name
+                    } else if (resp.code() == 409) {
+                        _profileActionError.value = "Server blocked duplicate Class/Roll ($cleanClass #$cleanRoll)."
+                        onComplete(false)
+                        return@launch
+                    }
+                } catch (_: Throwable) {
+                    // Offline / network unavailable: stays PENDING for SyncWorker
+                }
+            }
+
+            val updatedEntity = existing.copy(
+                studentName = cleanName,
+                fatherName = cleanFather,
+                className = cleanClass,
+                rollNumber = cleanRoll,
+                qrPayload = updatedQr,
+                encryptedFaceEmbedding = encEmbedding,
+                faceThumbnailBytes = thumbBytes,
+                syncStatus = finalSyncStatus
+            )
+            studentDao.updateStudent(updatedEntity)
+
+            _attendanceState.update { state ->
+                state.copy(
+                    selectedStudent = if (state.selectedStudent?.studentUid == studentUid) updatedEntity else state.selectedStudent,
+                    lastAutoMarkedStudent = if (state.lastAutoMarkedStudent?.studentUid == studentUid) updatedEntity else state.lastAutoMarkedStudent
+                )
+            }
+            if (finalSyncStatus == SyncStatus.PENDING.name) {
+                SyncWorker.enqueueImmediateWhenOnline(getApplication())
+            }
+            _profileActionMessage.value = "Updated profile for $cleanName ($cleanClass, Roll #$cleanRoll)."
+            onComplete(true)
+        }
+    }
+
+    fun deleteStudentProfile(studentUid: String, onComplete: () -> Unit = {}) {
+        viewModelScope.launch {
+            _profileActionError.value = null
+            _profileActionMessage.value = null
+            val existing = studentDao.findByUid(studentUid)
+            studentDao.deleteStudentByUid(studentUid)
+
+            var deletedRemotely = false
+            val jwt = prefs.getDecryptedJwt()
+            if (!jwt.isNullOrBlank() && container.connectivityObserver.checkCurrentConnectivity()) {
+                try {
+                    val api = AttendanceApiService.create(prefs.getBackendBaseUrl())
+                    val resp = withContext(Dispatchers.IO) {
+                        api.deleteStudent("Bearer $jwt", studentUid)
+                    }
+                    if (resp.isSuccessful || resp.code() == 404) {
+                        deletedRemotely = true
+                    }
+                } catch (_: Throwable) {
+                    deletedRemotely = false
+                }
+            }
+            if (!deletedRemotely) {
+                prefs.addPendingDeletedStudentUid(studentUid)
+                SyncWorker.enqueueImmediateWhenOnline(getApplication())
+            } else {
+                prefs.removePendingDeletedStudentUid(studentUid)
+            }
+
+            _attendanceState.update { state ->
+                state.copy(
+                    selectedStudent = if (state.selectedStudent?.studentUid == studentUid) null else state.selectedStudent,
+                    lastAutoMarkedStudent = if (state.lastAutoMarkedStudent?.studentUid == studentUid) null else state.lastAutoMarkedStudent,
+                    autoAdvancePending = if (state.selectedStudent?.studentUid == studentUid) false else state.autoAdvancePending
+                )
+            }
+            _profileActionMessage.value =
+                "Deleted profile for ${existing?.studentName ?: "student"}. Past attendance records remain preserved."
+            onComplete()
+        }
     }
 
     // --- ATTENDANCE & FACIAL VERIFICATION ---

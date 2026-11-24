@@ -24,13 +24,16 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.CloudOff
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Person
-import androidx.compose.material.icons.filled.QrCode
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.School
 import androidx.compose.material.icons.filled.Search
@@ -38,12 +41,19 @@ import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SegmentedButton
@@ -67,6 +77,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -75,6 +86,7 @@ import com.example.data.local.AttendanceRecordEntity
 import com.example.data.local.StudentEntity
 import com.example.domain.AttendanceStatus
 import com.example.domain.SchoolConstants
+import com.example.ui.components.LiveFaceCameraPanel
 import com.example.ui.components.LiveQrScannerDialog
 import com.example.ui.theme.AbsentRed
 import com.example.ui.theme.AbsentRedBg
@@ -102,12 +114,16 @@ fun RecordsSyncScreen(
     val lastSyncEpoch by viewModel.lastSyncEpoch.collectAsStateWithLifecycle()
     val syncMessage by viewModel.syncMessage.collectAsStateWithLifecycle()
     val isSyncing by viewModel.isSyncing.collectAsStateWithLifecycle()
+    val profileActionMessage by viewModel.profileActionMessage.collectAsStateWithLifecycle()
+    val profileActionError by viewModel.profileActionError.collectAsStateWithLifecycle()
 
     var selectedTab by remember { mutableIntStateOf(0) } // 0 = Attendance Ledger, 1 = Class-wise Student Profiles
     var searchQuery by remember { mutableStateOf("") }
     var selectedClassFilter by remember { mutableStateOf<String?>(null) }
     var showQrLookup by remember { mutableStateOf(false) }
     var inspectedStudent by remember { mutableStateOf<StudentEntity?>(null) }
+    var editingStudent by remember { mutableStateOf<StudentEntity?>(null) }
+    var deletingStudent by remember { mutableStateOf<StudentEntity?>(null) }
 
     Column(
         modifier = modifier
@@ -200,6 +216,41 @@ fun RecordsSyncScreen(
                     text = "Append-Only Protected Attendance Ledger: Deletion is disabled by SQLite/PostgreSQL triggers and DAO constraints.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSecondaryContainer
+                )
+            }
+        }
+
+        profileActionMessage?.let { msg ->
+            Surface(
+                color = VerifiedGreenBg,
+                shape = RoundedCornerShape(10.dp),
+                border = BorderStroke(1.dp, VerifiedGreen),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("student_action_success_banner")
+            ) {
+                Text(
+                    text = msg,
+                    color = VerifiedGreen,
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.padding(10.dp)
+                )
+            }
+        }
+
+        profileActionError?.let { err ->
+            Surface(
+                color = MaterialTheme.colorScheme.errorContainer,
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("student_action_error_banner")
+            ) {
+                Text(
+                    text = err,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.padding(10.dp)
                 )
             }
         }
@@ -391,7 +442,15 @@ fun RecordsSyncScreen(
                             ClassStudentProfileCard(
                                 student = st,
                                 records = stRecords,
-                                onClick = { inspectedStudent = st }
+                                onClick = { inspectedStudent = st },
+                                onEdit = {
+                                    viewModel.clearProfileActionMessages()
+                                    editingStudent = st
+                                },
+                                onDelete = {
+                                    viewModel.clearProfileActionMessages()
+                                    deletingStudent = st
+                                }
                             )
                         }
                     }
@@ -416,14 +475,62 @@ fun RecordsSyncScreen(
         )
     }
 
-    inspectedStudent?.let { student ->
-        val studentHistory = remember(attendance, student.studentUid) {
-            attendance.filter { it.studentUid == student.studentUid }
+    inspectedStudent?.let { selected ->
+        val latestStudent = students.firstOrNull { it.studentUid == selected.studentUid } ?: selected
+        val studentHistory = remember(attendance, latestStudent.studentUid) {
+            attendance.filter { it.studentUid == latestStudent.studentUid }
         }
         StudentProfileDetailDialog(
-            student = student,
+            student = latestStudent,
             history = studentHistory,
+            onEdit = {
+                viewModel.clearProfileActionMessages()
+                inspectedStudent = null
+                editingStudent = latestStudent
+            },
+            onDelete = {
+                viewModel.clearProfileActionMessages()
+                inspectedStudent = null
+                deletingStudent = latestStudent
+            },
             onDismiss = { inspectedStudent = null }
+        )
+    }
+
+    editingStudent?.let { studentToEdit ->
+        EditStudentProfileDialog(
+            student = studentToEdit,
+            errorMessage = profileActionError,
+            onSave = { name, father, cls, roll, faceBmp ->
+                viewModel.editStudentProfile(
+                    studentUid = studentToEdit.studentUid,
+                    studentName = name,
+                    fatherName = father,
+                    className = cls,
+                    rollNumber = roll,
+                    updatedFaceBitmap = faceBmp
+                ) { succeeded ->
+                    if (succeeded) {
+                        editingStudent = null
+                    }
+                }
+            },
+            onDismiss = {
+                viewModel.clearProfileActionMessages()
+                editingStudent = null
+            }
+        )
+    }
+
+    deletingStudent?.let { studentToDelete ->
+        DeleteStudentConfirmDialog(
+            student = studentToDelete,
+            onConfirmDelete = {
+                viewModel.deleteStudentProfile(studentToDelete.studentUid) {
+                    deletingStudent = null
+                }
+            },
+            onDismiss = { deletingStudent = null }
         )
     }
 }
@@ -432,7 +539,9 @@ fun RecordsSyncScreen(
 private fun ClassStudentProfileCard(
     student: StudentEntity,
     records: List<AttendanceRecordEntity>,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    onEdit: () -> Unit,
+    onDelete: () -> Unit
 ) {
     val thumb = remember(student.studentUid) {
         runCatching {
@@ -506,11 +615,28 @@ private fun ClassStudentProfileCard(
                 }
             }
 
-            Icon(
-                Icons.Default.QrCode,
-                contentDescription = "Open full student profile and QR",
-                tint = MaterialTheme.colorScheme.primary
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(
+                    onClick = onEdit,
+                    modifier = Modifier.testTag("edit_student_card_${student.rollNumber}")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Edit,
+                        contentDescription = "Edit ${student.studentName}",
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                }
+                IconButton(
+                    onClick = onDelete,
+                    modifier = Modifier.testTag("delete_student_card_${student.rollNumber}")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Delete,
+                        contentDescription = "Delete ${student.studentName}",
+                        tint = AbsentRed
+                    )
+                }
+            }
         }
     }
 }
@@ -532,6 +658,8 @@ private fun MiniCountPill(text: String, fgColor: Color, bgColor: Color) {
 private fun StudentProfileDetailDialog(
     student: StudentEntity,
     history: List<AttendanceRecordEntity>,
+    onEdit: () -> Unit,
+    onDelete: () -> Unit,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
@@ -684,6 +812,36 @@ private fun StudentProfileDetailDialog(
                     Text("Share Student QR Card")
                 }
 
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onEdit,
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(min = 48.dp)
+                            .testTag("edit_student_profile_button")
+                    ) {
+                        Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Edit Profile")
+                    }
+                    OutlinedButton(
+                        onClick = onDelete,
+                        border = BorderStroke(1.dp, AbsentRed),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = AbsentRed),
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(min = 48.dp)
+                            .testTag("delete_student_profile_button")
+                    ) {
+                        Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Delete Profile")
+                    }
+                }
+
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline)
 
                 Text(
@@ -729,6 +887,197 @@ private fun StudentProfileDetailDialog(
         confirmButton = {
             TextButton(onClick = onDismiss) {
                 Text("Close")
+            }
+        }
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun EditStudentProfileDialog(
+    student: StudentEntity,
+    errorMessage: String?,
+    onSave: (String, String, String, String, Bitmap?) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var studentName by remember(student.studentUid) { mutableStateOf(student.studentName) }
+    var fatherName by remember(student.studentUid) { mutableStateOf(student.fatherName) }
+    var selectedClass by remember(student.studentUid) { mutableStateOf(student.className) }
+    var rollNumber by remember(student.studentUid) { mutableStateOf(student.rollNumber) }
+    var classDropdownExpanded by remember { mutableStateOf(false) }
+    var showRecaptureCamera by remember { mutableStateOf(false) }
+    var updatedFaceBitmap by remember { mutableStateOf<Bitmap?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Edit Student Profile") },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                errorMessage?.let { err ->
+                    Surface(
+                        color = MaterialTheme.colorScheme.errorContainer,
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = err,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(10.dp)
+                        )
+                    }
+                }
+
+                OutlinedTextField(
+                    value = studentName,
+                    onValueChange = { studentName = it },
+                    label = { Text("Student Name") },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("edit_student_name_input")
+                )
+
+                OutlinedTextField(
+                    value = fatherName,
+                    onValueChange = { fatherName = it },
+                    label = { Text("Father Name") },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("edit_student_father_input")
+                )
+
+                ExposedDropdownMenuBox(
+                    expanded = classDropdownExpanded,
+                    onExpandedChange = { classDropdownExpanded = !classDropdownExpanded }
+                ) {
+                    OutlinedTextField(
+                        value = selectedClass,
+                        onValueChange = {},
+                        readOnly = true,
+                        label = { Text("Class") },
+                        trailingIcon = {
+                            ExposedDropdownMenuDefaults.TrailingIcon(expanded = classDropdownExpanded)
+                        },
+                        modifier = Modifier
+                            .menuAnchor(MenuAnchorType.PrimaryNotEditable)
+                            .fillMaxWidth()
+                            .testTag("edit_student_class_dropdown")
+                    )
+                    ExposedDropdownMenu(
+                        expanded = classDropdownExpanded,
+                        onDismissRequest = { classDropdownExpanded = false }
+                    ) {
+                        SchoolConstants.PRIMARY_CLASSES.forEach { cls ->
+                            DropdownMenuItem(
+                                text = { Text(cls) },
+                                onClick = {
+                                    selectedClass = cls
+                                    classDropdownExpanded = false
+                                }
+                            )
+                        }
+                    }
+                }
+
+                OutlinedTextField(
+                    value = rollNumber,
+                    onValueChange = { rollNumber = it.filter { ch -> ch.isLetterOrDigit() }.take(12) },
+                    label = { Text("Roll Number") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("edit_student_roll_input")
+                )
+
+                OutlinedButton(
+                    onClick = { showRecaptureCamera = !showRecaptureCamera },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp)
+                        .testTag("toggle_recapture_student_face")
+                ) {
+                    Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        when {
+                            updatedFaceBitmap != null -> "New Live Face Ready • Tap to Change"
+                            showRecaptureCamera -> "Hide Face Re-capture Camera"
+                            else -> "Re-capture Live Face (Optional)"
+                        }
+                    )
+                }
+
+                if (showRecaptureCamera) {
+                    LiveFaceCameraPanel(
+                        title = "Update Student Face",
+                        captureButtonText = "Capture Updated Face",
+                        defaultUseFrontCamera = false,
+                        allowCameraSwitch = true,
+                        isBusy = false,
+                        onFaceCaptured = { bmp ->
+                            updatedFaceBitmap = bmp
+                        }
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    onSave(studentName, fatherName, selectedClass, rollNumber, updatedFaceBitmap)
+                },
+                modifier = Modifier
+                    .heightIn(min = 48.dp)
+                    .testTag("save_edit_student_button")
+            ) {
+                Text("Save Changes")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
+}
+
+@Composable
+private fun DeleteStudentConfirmDialog(
+    student: StudentEntity,
+    onConfirmDelete: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Delete Student Profile?") },
+        text = {
+            Text(
+                text = "Delete student profile for ${student.studentName} (${student.className}, Roll #${student.rollNumber})? Past attendance records in the append-only ledger will remain preserved.",
+                style = MaterialTheme.typography.bodyMedium
+            )
+        },
+        confirmButton = {
+            Button(
+                onClick = onConfirmDelete,
+                colors = ButtonDefaults.buttonColors(containerColor = AbsentRed),
+                modifier = Modifier
+                    .heightIn(min = 48.dp)
+                    .testTag("confirm_delete_student_button")
+            ) {
+                Text("Delete Profile")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
             }
         }
     )

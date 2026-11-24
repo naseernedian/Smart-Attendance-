@@ -8,9 +8,12 @@ import retrofit2.Response
 import retrofit2.Retrofit
 import retrofit2.converter.moshi.MoshiConverterFactory
 import retrofit2.http.Body
+import retrofit2.http.DELETE
 import retrofit2.http.GET
 import retrofit2.http.Header
 import retrofit2.http.POST
+import retrofit2.http.PUT
+import retrofit2.http.Path
 import java.util.concurrent.TimeUnit
 
 interface AttendanceApiService {
@@ -26,6 +29,30 @@ interface AttendanceApiService {
 
     @POST("api/v1/auth/password-reset/direct")
     suspend fun resetPasswordDirect(@Body request: DirectPasswordResetRequestDto): Response<AdminRegistrationResponse>
+
+    @PUT("api/v1/auth/me")
+    suspend fun updateMyProfile(
+        @Header("Authorization") bearerToken: String,
+        @Body request: AdminUpdateRequestDto
+    ): Response<AdminProfileDto>
+
+    @DELETE("api/v1/auth/me")
+    suspend fun deleteMyAccount(
+        @Header("Authorization") bearerToken: String
+    ): Response<DeleteActionResponseDto>
+
+    @PUT("api/v1/students/{student_uid}")
+    suspend fun updateStudent(
+        @Header("Authorization") bearerToken: String,
+        @Path("student_uid") studentUid: String,
+        @Body request: StudentUpdateRequestDto
+    ): Response<StudentSyncItemDto>
+
+    @DELETE("api/v1/students/{student_uid}")
+    suspend fun deleteStudent(
+        @Header("Authorization") bearerToken: String,
+        @Path("student_uid") studentUid: String
+    ): Response<DeleteActionResponseDto>
 
     @POST("api/v1/sync/students")
     suspend fun syncStudents(

@@ -34,6 +34,7 @@ import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Email
+import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PhotoLibrary
@@ -65,6 +66,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -74,6 +76,8 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.local.AdminEntity
 import com.example.domain.SchoolConstants
+import com.example.security.BiometricAuthHelper
+import com.example.security.BiometricAvailability
 import com.example.ui.components.DocumentCameraCaptureDialog
 import com.example.ui.components.LiveFaceCameraPanel
 import com.example.ui.theme.VerifiedGreen
@@ -89,6 +93,16 @@ fun AdminAuthScreen(
     val uiState by authViewModel.uiState.collectAsStateWithLifecycle()
     val isOnline by authViewModel.isOnline.collectAsStateWithLifecycle()
     val backendUrl by authViewModel.backendUrl.collectAsStateWithLifecycle()
+    val biometricEnabled by authViewModel.biometricEnabled.collectAsStateWithLifecycle()
+    val biometricAdminUid by authViewModel.biometricAdminUid.collectAsStateWithLifecycle()
+    val localAdmins by authViewModel.localAdmins.collectAsStateWithLifecycle()
+    val biometricTargetAdmin = remember(biometricEnabled, biometricAdminUid, localAdmins) {
+        if (biometricEnabled && !biometricAdminUid.isNullOrBlank()) {
+            localAdmins.firstOrNull { it.adminUid == biometricAdminUid }
+        } else {
+            null
+        }
+    }
     var showServerDialog by remember { mutableStateOf(false) }
 
     if (uiState.stage != AuthStage.LOGIN) {
@@ -200,7 +214,10 @@ fun AdminAuthScreen(
             when (uiState.stage) {
                 AuthStage.LOGIN -> LoginPanel(
                     uiState = uiState,
+                    biometricTargetAdmin = biometricTargetAdmin,
                     onSubmit = authViewModel::submitCredentials,
+                    onBiometricAuthenticated = authViewModel::completeBiometricLogin,
+                    onBiometricError = authViewModel::setAuthError,
                     onGoRegister = { authViewModel.navigateTo(AuthStage.REGISTER) },
                     onGoReset = { authViewModel.navigateTo(AuthStage.PASSWORD_RESET) }
                 )
@@ -278,10 +295,16 @@ fun AdminAuthScreen(
 @Composable
 private fun LoginPanel(
     uiState: AdminAuthUiState,
-    onSubmit: (String, String) -> Unit,
+    biometricTargetAdmin: AdminEntity?,
+    onSubmit: (String, String, Boolean) -> Unit,
+    onBiometricAuthenticated: (String) -> Unit,
+    onBiometricError: (String) -> Unit,
     onGoRegister: () -> Unit,
     onGoReset: () -> Unit
 ) {
+    val context = LocalContext.current
+    val biometricAvailability = remember(context) { BiometricAuthHelper.checkAvailability(context) }
+
     var username by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var passwordVisible by remember { mutableStateOf(false) }
@@ -344,7 +367,7 @@ private fun LoginPanel(
             )
 
             Button(
-                onClick = { onSubmit(username, password) },
+                onClick = { onSubmit(username, password, false) },
                 enabled = !uiState.isBusy,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -352,6 +375,49 @@ private fun LoginPanel(
                     .testTag("admin_login_button")
             ) {
                 Text("Sign In")
+            }
+
+            OutlinedButton(
+                onClick = {
+                    when {
+                        biometricAvailability != BiometricAvailability.AVAILABLE -> {
+                            onBiometricError("Set up fingerprint, face unlock, or screen lock in your Android phone Settings first.")
+                        }
+                        biometricTargetAdmin == null -> {
+                            onBiometricError("Enable Biometric Login from the side menu after signing in once with your password.")
+                        }
+                        else -> {
+                            BiometricAuthHelper.authenticate(
+                                context = context,
+                                title = "Biometric Login",
+                                subtitle = "Use your phone's biometric to sign in as ${biometricTargetAdmin.fullName}",
+                                negativeButtonText = "Use Password",
+                                onSucceeded = { onBiometricAuthenticated(biometricTargetAdmin.adminUid) },
+                                onError = onBiometricError
+                            )
+                        }
+                    }
+                },
+                enabled = !uiState.isBusy,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+                    .testTag("biometric_login_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Fingerprint,
+                    contentDescription = "Sign in with phone biometric",
+                    tint = MaterialTheme.colorScheme.primary
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    if (biometricTargetAdmin != null) {
+                        "Sign In with Biometric • ${biometricTargetAdmin.fullName}"
+                    } else {
+                        "Sign In with Biometric"
+                    }
+                )
             }
 
             Row(
